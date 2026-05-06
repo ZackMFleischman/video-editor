@@ -89,13 +89,20 @@ class PreviewPanel(QWidget):
         # --- timeline playback state ---
         self._tl_playing = False
         self._tl_pos = 0.0
-        self._tl_rendered_path: Optional[str] = None  # currently-loaded preview file
-        self._tl_pending_play_at: Optional[float] = None  # play-after-render request
+        self._tl_rendered_path: Optional[str] = None
+        self._tl_pending_play_at: Optional[float] = None
         self._tl_render_thread: Optional[QThread] = None
+        self._tl_render_worker = None  # held to prevent GC before the worker's slot fires
+        self._tl_render_again = False  # request to re-render after current finishes
         self._tl_timer = QTimer(self)
         self._tl_timer.setInterval(50)
         self._tl_timer.timeout.connect(self._tl_tick)
         self._tl_resume_after_scrub = False
+        # Debounce timer for auto-render on project changes
+        self._dirty_timer = QTimer(self)
+        self._dirty_timer.setSingleShot(True)
+        self._dirty_timer.setInterval(400)
+        self._dirty_timer.timeout.connect(self._dirty_fire)
 
         # --- common controls ---
         self.play_btn = QPushButton("▶")
@@ -229,10 +236,38 @@ class PreviewPanel(QWidget):
         if preview_render.is_cached(self._project):
             self._tl_play_cached(self._tl_pos, autoplay=True)
             return True
-        # Render in background
+        # Render in background and play when done
         self._tl_pending_play_at = self._tl_pos
         self._start_render(then_autoplay=True)
         return True
+
+    # ---- public scrub for timeline-driven seeking ----
+
+    def scrub_to(self, t: float):
+        """Show the frame at timeline time `t`. Public for external callers."""
+        self._scrub_to(t)
+
+    # ---- auto-render-on-change (debounced) ----
+
+    def mark_dirty(self):
+        """Project state changed — schedule a background re-render."""
+        if not self._project or not self._project.clips:
+            return
+        if not ffmpeg_available():
+            return
+        # Restart debounce
+        self._dirty_timer.start()
+
+    def _dirty_fire(self):
+        if not self._project or not self._project.clips:
+            return
+        if preview_render.is_cached(self._project):
+            return  # nothing changed in a way that matters
+        # If something is currently rendering, queue another for after.
+        if self._tl_render_thread is not None:
+            self._tl_render_again = True
+            return
+        self._start_render(then_autoplay=False)
 
     def pause_timeline(self):
         if not self._tl_playing:
@@ -252,6 +287,8 @@ class PreviewPanel(QWidget):
     def _tl_play_cached(self, t: float, autoplay: bool):
         """Load the cached preview file and (optionally) start playing at `t`."""
         path = str(preview_render.cached_path(self._project))
+        log.info("[tl_play_cached] path=%s t=%.2f autoplay=%s exists=%s",
+                 path, t, autoplay, Path(path).exists())
         self._tl_rendered_path = path
         self._current_path = path
         self.source_lbl.setText(f"timeline preview — {self._project.duration:.1f}s")
@@ -259,6 +296,7 @@ class PreviewPanel(QWidget):
         try:
             self._backend.load_and_play(path, t)
         except Exception as e:
+            log.exception("backend.load_and_play failed")
             self._show_error(str(e))
             return
         if not autoplay:
@@ -293,9 +331,12 @@ class PreviewPanel(QWidget):
 
     def _start_render(self, then_autoplay: bool):
         if self._tl_render_thread is not None:
-            return  # already rendering
+            log.info("render already in progress; queueing another")
+            self._tl_render_again = True
+            return
         if not self._project or not self._project.clips:
             return
+        log.info("starting preview render (autoplay=%s)", then_autoplay)
         self.render_overlay.show()
         self.render_lbl.setText("Rendering preview…")
         self.render_bar.setValue(0)
@@ -311,23 +352,34 @@ class PreviewPanel(QWidget):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_render_thread)
+        # IMPORTANT: PyQt connections to bound methods don't always keep the
+        # receiver alive. Without a Python reference here, `worker` gets GC'd
+        # before its `started → run` slot ever fires.
+        self._tl_render_worker = worker
         self._tl_render_thread = thread
         thread.start()
 
     def _clear_render_thread(self):
         self._tl_render_thread = None
+        self._tl_render_worker = None
+        # If another render was requested while this one was running, kick it off now
+        if self._tl_render_again:
+            self._tl_render_again = False
+            QTimer.singleShot(0, lambda: self._start_render(then_autoplay=False))
 
     def _on_render_done(self, path: str, then_autoplay: bool):
+        log.info("render done -> %s (autoplay=%s)", path, then_autoplay)
         self.render_overlay.hide()
         if then_autoplay and self._tl_pending_play_at is not None:
             t = self._tl_pending_play_at
             self._tl_pending_play_at = None
             self._tl_play_cached(t, autoplay=True)
         else:
-            t = self._tl_pos
-            self._tl_play_cached(t, autoplay=False)
+            # Show the current playhead frame so the user sees their composition.
+            self._tl_play_cached(self._tl_pos, autoplay=False)
 
     def _on_render_failed(self, err: str):
+        log.error("render failed: %s", err)
         self.render_overlay.hide()
         self._show_error(f"Preview render failed: {err}")
 

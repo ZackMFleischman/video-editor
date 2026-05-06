@@ -139,15 +139,22 @@ class _ClipItem(QGraphicsRectItem):
                 if new_track and current_track and new_track.type == current_track.type:
                     self.clip.track_id = new_track_id
         self._mode = None
-        self.parent_view._refresh_layout()
-        self.parent_view.clipChanged.emit(self.clip.id)
-        super().mouseReleaseEvent(e)
+        view = self.parent_view
+        clip_id = self.clip.id
+        # _refresh_layout() will destroy this item's C++ object, so do that
+        # last — and don't call super() afterwards (it would touch the dead
+        # object).
+        view._refresh_layout()
+        view.clipChanged.emit(clip_id)
+        e.accept()
 
 
 class TimelineView(QGraphicsView):
     clipSelected = pyqtSignal(str)  # clip id
     clipChanged = pyqtSignal(str)
-    playheadMoved = pyqtSignal(float)  # seconds
+    playheadMoved = pyqtSignal(float)  # seconds — fires during drag/click on ruler
+    playheadPressed = pyqtSignal()
+    playheadReleased = pyqtSignal(float)  # final seconds
 
     def __init__(self):
         super().__init__()
@@ -157,8 +164,6 @@ class TimelineView(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#1c1c1c")))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        # Align scene to top-left so when the area is taller than content the
-        # tracks stay pinned to the top instead of being centered.
         self.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.project: Optional[Project] = None
         self.px_per_sec: float = DEFAULT_PX_PER_SEC
@@ -166,6 +171,8 @@ class TimelineView(QGraphicsView):
         self._clip_items: dict[str, _ClipItem] = {}
         self._playhead_item: Optional[QGraphicsRectItem] = None
         self._scene.selectionChanged.connect(self._on_selection_changed)
+        # Playhead drag state
+        self._dragging_playhead = False
 
     # ---- public ----
 
@@ -304,14 +311,44 @@ class TimelineView(QGraphicsView):
         super().wheelEvent(e)
 
     def mousePressEvent(self, e: QMouseEvent):
-        # Click on ruler => move playhead
         scene_pt = self.mapToScene(e.pos())
-        if scene_pt.y() < RULER_HEIGHT and scene_pt.x() > TRACK_LABEL_WIDTH:
+        # Press on the ruler OR on the playhead line itself starts a drag.
+        on_ruler = scene_pt.y() < RULER_HEIGHT and scene_pt.x() > TRACK_LABEL_WIDTH
+        on_playhead = (
+            self._playhead_item is not None
+            and abs(scene_pt.x() - self._playhead_x()) <= 5
+            and scene_pt.y() < (RULER_HEIGHT + len(self.project.tracks) * TRACK_HEIGHT if self.project else RULER_HEIGHT)
+        )
+        if on_ruler or on_playhead:
+            self._dragging_playhead = True
+            self.playheadPressed.emit()
             t = (scene_pt.x() - TRACK_LABEL_WIDTH) / self.px_per_sec
             self.set_playhead(max(0.0, t))
             self.playheadMoved.emit(self.playhead)
+            e.accept()
             return
         super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e: QMouseEvent):
+        if self._dragging_playhead:
+            scene_pt = self.mapToScene(e.pos())
+            t = (scene_pt.x() - TRACK_LABEL_WIDTH) / self.px_per_sec
+            self.set_playhead(max(0.0, t))
+            self.playheadMoved.emit(self.playhead)
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e: QMouseEvent):
+        if self._dragging_playhead:
+            self._dragging_playhead = False
+            self.playheadReleased.emit(self.playhead)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def _playhead_x(self) -> float:
+        return TRACK_LABEL_WIDTH + self.playhead * self.px_per_sec
 
 
 def _format_time(seconds: float) -> str:

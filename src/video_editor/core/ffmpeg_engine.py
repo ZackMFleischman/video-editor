@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -328,6 +329,9 @@ def render_project(
     cmd = [
         ffmpeg_bin(),
         "-y",
+        "-loglevel", "error",
+        "-nostats",
+        "-progress", "pipe:1",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", final_video_label,
@@ -343,31 +347,74 @@ def render_project(
         output_path,
     ]
 
+    # We open stdout for progress (newline-delimited), and stderr for any errors.
+    # On Windows, leaving stderr undrained while stdout is being read can cause
+    # FFmpeg to block once the stderr pipe buffer fills (even small writes).
+    # So: drain BOTH pipes concurrently in worker threads.
+    import threading
+
+    creationflags = 0
+    if sys.platform == "win32":
+        # Avoid spawning a console window when launched from a GUI app
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
-        bufsize=1,
+        creationflags=creationflags,
     )
 
-    last_progress = 0.0
-    if proc.stdout is not None:
-        for line in proc.stdout:
-            if progress and "time=" in line:
-                # parse time=00:00:00.00
-                try:
-                    t = line.split("time=", 1)[1].split(" ", 1)[0]
+    last_progress = [0.0]
+    stderr_buf: list[str] = []
+
+    def _drain_stdout():
+        if proc.stdout is None:
+            return
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line or not progress:
+                continue
+            try:
+                if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                    val = int(line.split("=", 1)[1])
+                    cur = val / 1_000_000.0 if "out_time_us=" in line else val / 1_000.0
+                    pct = max(0.0, min(1.0, cur / duration)) if duration > 0 else 0.0
+                    if pct - last_progress[0] >= 0.01:
+                        last_progress[0] = pct
+                        progress(pct)
+                elif line.startswith("out_time="):
+                    t = line.split("=", 1)[1]
                     h, m, s = t.split(":")
                     cur = int(h) * 3600 + int(m) * 60 + float(s)
                     pct = max(0.0, min(1.0, cur / duration)) if duration > 0 else 0.0
-                    if pct - last_progress >= 0.01:
-                        last_progress = pct
+                    if pct - last_progress[0] >= 0.01:
+                        last_progress[0] = pct
                         progress(pct)
-                except Exception:
-                    pass
+                elif line == "progress=end":
+                    progress(1.0)
+            except (ValueError, IndexError):
+                pass
+
+    def _drain_stderr():
+        if proc.stderr is None:
+            return
+        for raw in proc.stderr:
+            stderr_buf.append(raw)
+
+    t_out = threading.Thread(target=_drain_stdout, daemon=True)
+    t_err = threading.Thread(target=_drain_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
     code = proc.wait()
+    t_out.join(timeout=2)
+    t_err.join(timeout=2)
+
     if code != 0:
-        raise RuntimeError(f"FFmpeg failed with exit code {code}")
+        err = "".join(stderr_buf).strip()
+        raise RuntimeError(f"FFmpeg failed (exit {code}):\n{err[-2000:]}")
     if progress:
         progress(1.0)

@@ -180,17 +180,40 @@ class MainWindow(QMainWindow):
 
     def _wire_signals(self):
         self.timeline.clipSelected.connect(self._on_clip_selected)
-        self.timeline.clipChanged.connect(lambda _id: (self.properties.set_clip(self.project.get_clip(_id)), self.timeline._refresh_layout()))
+        self.timeline.clipChanged.connect(self._on_clip_changed)
+        self.timeline.playheadPressed.connect(self._on_playhead_pressed)
         self.timeline.playheadMoved.connect(self._on_playhead_moved)
-        self.properties.clipUpdated.connect(lambda _id: self.timeline._refresh_layout())
+        self.timeline.playheadReleased.connect(self._on_playhead_released)
+        self.properties.clipUpdated.connect(self._on_clip_changed)
         self.preview.timelinePlayheadChanged.connect(self.timeline.set_playhead)
+        self._tl_was_playing_before_drag = False
+
+    def _on_clip_changed(self, _clip_id: str):
+        self.properties.set_clip(self.project.get_clip(_clip_id))
+        self.timeline._refresh_layout()
+        # Project state changed — schedule a background re-render.
+        self.preview.mark_dirty()
+
+    def _on_playhead_pressed(self):
+        self._tl_was_playing_before_drag = self.preview.is_timeline_playing()
+        if self._tl_was_playing_before_drag:
+            self.preview.pause_timeline()
 
     def _on_playhead_moved(self, t: float):
-        # User scrubbed the timeline ruler. If we were playing, restart from there.
-        if self.preview.is_timeline_playing():
+        # During drag (or single click): show the frame at t in the preview.
+        if self.project.duration > 0:
+            self.preview.scrub_to(t)
+
+    def _on_playhead_released(self, t: float):
+        if self._tl_was_playing_before_drag:
             self.preview.play_timeline_from(t)
+        self._tl_was_playing_before_drag = False
 
     def _toggle_timeline_play(self):
+        import logging
+        log = logging.getLogger("main_window")
+        log.info("[toggle_timeline_play] called; is_playing=%s, clips=%d, playhead=%.2f",
+                 self.preview.is_timeline_playing(), len(self.project.clips), self.timeline.playhead)
         if self.preview.is_timeline_playing():
             self.preview.pause_timeline()
             if hasattr(self, "play_action"):
@@ -199,12 +222,13 @@ class MainWindow(QMainWindow):
         if not self.project.clips:
             self.statusBar().showMessage("Add some clips first.", 3000)
             return
-        # If playhead is at the end, rewind
         start_t = self.timeline.playhead
         if start_t >= self.project.duration - 0.05:
             start_t = 0.0
             self.timeline.set_playhead(0.0)
+        log.info("[toggle_timeline_play] calling play_timeline_from(%.2f)", start_t)
         ok = self.preview.play_timeline_from(start_t)
+        log.info("[toggle_timeline_play] play_timeline_from returned %s", ok)
         if ok and hasattr(self, "play_action"):
             self.play_action.setText("⏸ Pause")
 
@@ -276,6 +300,7 @@ class MainWindow(QMainWindow):
         for p in paths:
             self._add_media(p)
         self.timeline._refresh_layout()
+        self.preview.mark_dirty()
 
     def _add_media(self, path: str):
         try:
@@ -334,6 +359,7 @@ class MainWindow(QMainWindow):
             clip.out_point = split_source_time
             self.project.add_clip(new_clip)
         self.timeline._refresh_layout()
+        self.preview.mark_dirty()
 
     def _delete_selected(self):
         cid = self.timeline.selected_clip_id()
@@ -342,6 +368,7 @@ class MainWindow(QMainWindow):
         self.project.remove_clip(cid)
         self.properties.set_clip(None)
         self.timeline._refresh_layout()
+        self.preview.mark_dirty()
 
     def _add_track(self, kind: TrackType):
         self.project.add_track(kind)
@@ -384,6 +411,7 @@ class MainWindow(QMainWindow):
         )
         self.project.add_clip(clip)
         self.timeline._refresh_layout()
+        self.preview.mark_dirty()
         self.statusBar().showMessage(f"Inserted speech: {Path(audio_path).name}", 3000)
 
     # ---- export ----
